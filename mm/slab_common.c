@@ -22,6 +22,10 @@
 #include <asm/page.h>
 #include <linux/memcontrol.h>
 
+#ifdef CONFIG_XMP
+#include <xen/interface/xmp.h>
+#endif
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/kmem.h>
 
@@ -510,6 +514,9 @@ out_unlock:
 		}
 		return NULL;
 	}
+#ifdef CONFIG_XMP
+	s->xmp_cache_index = XMP_INDEX(XMP_RESTRICTED_PDOMAIN, 0);
+#endif
 	return s;
 }
 EXPORT_SYMBOL(kmem_cache_create_usercopy);
@@ -522,6 +529,23 @@ kmem_cache_create(const char *name, unsigned int size, unsigned int align,
 					  ctor);
 }
 EXPORT_SYMBOL(kmem_cache_create);
+
+struct kmem_cache *
+kmem_cache_create_isolated(const char *name, unsigned int size, unsigned int align,
+		slab_flags_t flags, void (*ctor)(void *), uint16_t altp2m_id)
+{
+	struct kmem_cache *s = kmem_cache_create(name, size, align, flags, ctor);
+
+	if (!s)
+		return NULL;
+
+#ifdef CONFIG_XMP
+	s->xmp_cache_index = xmp_sign_val(s, altp2m_id);
+#endif
+
+	return s;
+}
+EXPORT_SYMBOL(kmem_cache_create_isolated);
 
 static void slab_caches_to_rcu_destroy_workfn(struct work_struct *work)
 {

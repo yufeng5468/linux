@@ -312,6 +312,20 @@
 #endif
 
 /*
+ * xMP Data
+ */
+#ifdef CONFIG_XMP
+#define XMP_DATA(align)							\
+	. = ALIGN((align));						\
+	.xmpdata	  : AT(ADDR(.xmpdata) - LOAD_OFFSET) {		\
+		__start_xmpdata = .;					\
+		*(.xmpdata)						\
+		. = ALIGN((align));					\
+		__end_xmpdata = .;					\
+	}
+#endif
+
+/*
  * Read only Data
  */
 #define RO_DATA_SECTION(align)						\
@@ -331,6 +345,9 @@
 	.rodata1          : AT(ADDR(.rodata1) - LOAD_OFFSET) {		\
 		*(.rodata1)						\
 	}								\
+									\
+	/* xMP */							\
+	XMP_DATA((align))						\
 									\
 	/* PCI quirks */						\
 	.pci_fixup        : AT(ADDR(.pci_fixup) - LOAD_OFFSET) {	\

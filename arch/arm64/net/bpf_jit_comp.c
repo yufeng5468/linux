@@ -25,6 +25,8 @@
 #define TMP_REG_2 (MAX_BPF_JIT_REG + 1)
 #define TCALL_CNT (MAX_BPF_JIT_REG + 2)
 #define TMP_REG_3 (MAX_BPF_JIT_REG + 3)
+#define TMP_REG_TAG (MAX_BPF_JIT_REG + 4)
+#define TMP_REG_MTE_ON (MAX_BPF_JIT_REG + 5)
 
 /* Map BPF registers to A64 registers */
 static const int bpf2a64[] = {
@@ -47,11 +49,21 @@ static const int bpf2a64[] = {
 	[TMP_REG_1] = A64_R(10),
 	[TMP_REG_2] = A64_R(11),
 	[TMP_REG_3] = A64_R(12),
+	/* temporary register for sBPF tag mask */
+	//[TMP_REG_TAG] = A64_R(13),
+	[TMP_REG_TAG] = A64_R(27),
+	/* temporary register for sBPF, stores MTE on/off status */
+	[TMP_REG_MTE_ON] = A64_R(28),
 	/* tail_call_cnt */
 	[TCALL_CNT] = A64_R(26),
 	/* temporary register for blinding constants */
 	[BPF_REG_AX] = A64_R(9),
 };
+
+static int jit_count_cbpf;
+static int jit_count_ebpf;
+#define JIT_COUNT_THLD 16
+//#define JIT_COUNT_THLD 32
 
 struct jit_ctx {
 	const struct bpf_prog *prog;
@@ -181,20 +193,22 @@ static bool is_addsub_imm(u32 imm)
 
 /* Tail call offset to jump into */
 #if IS_ENABLED(CONFIG_ARM64_BTI_KERNEL)
-#define PROLOGUE_OFFSET 8
+#define PROLOGUE_OFFSET 9
 #else
-#define PROLOGUE_OFFSET 7
+#define PROLOGUE_OFFSET 8
 #endif
 
 static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 {
-	const struct bpf_prog *prog = ctx->prog;
+	struct bpf_prog *prog = ctx->prog;
 	const u8 r6 = bpf2a64[BPF_REG_6];
 	const u8 r7 = bpf2a64[BPF_REG_7];
 	const u8 r8 = bpf2a64[BPF_REG_8];
 	const u8 r9 = bpf2a64[BPF_REG_9];
 	const u8 fp = bpf2a64[BPF_REG_FP];
 	const u8 tcc = bpf2a64[TCALL_CNT];
+	const u8 tmp_tag_reg = bpf2a64[TMP_REG_TAG];
+	const u8 tmp_mte_on_reg = bpf2a64[TMP_REG_MTE_ON];
 	const int idx0 = ctx->idx;
 	int cur_offset;
 
@@ -233,6 +247,8 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	emit(A64_PUSH(r6, r7, A64_SP), ctx);
 	emit(A64_PUSH(r8, r9, A64_SP), ctx);
 	emit(A64_PUSH(fp, tcc, A64_SP), ctx);
+	emit(A64_PUSH(tmp_tag_reg, tmp_mte_on_reg, A64_SP), ctx);
+	prog->num_logue_instr += 1;
 
 	/* Set up BPF prog stack base register */
 	emit(A64_MOV(1, fp, A64_SP), ctx);
@@ -245,6 +261,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 		if (cur_offset != PROLOGUE_OFFSET) {
 			pr_err_once("PROLOGUE_OFFSET = %d, expected %d!\n",
 				    cur_offset, PROLOGUE_OFFSET);
+			MTE_PRNT("early exit\n");
 			return -1;
 		}
 
@@ -258,6 +275,28 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 
 	/* Set up function call stack */
 	emit(A64_SUB_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
+
+	if (prog->mte) {
+		/* Load the tag mask, e.g. 0xf3ffffffffffffff into TMP_REG_TAG */
+		const u8 tmp3 = bpf2a64[TMP_REG_3];
+		/* Load the upper 32 bits */
+		emit_a64_mov_i(1, tmp_tag_reg, 0xf3ffffff, ctx);
+		emit(A64_LSL(1, tmp_tag_reg, tmp_tag_reg, 32), ctx);
+		/* Load the lower 32 bits */
+		u32 my_a64_insn = A64_ORR_I(1, tmp_tag_reg, tmp_tag_reg, 0xffffffff);
+		if (my_a64_insn != AARCH64_BREAK_FAULT) {
+			emit(my_a64_insn, ctx);
+		} else {
+			emit_a64_mov_i(1, tmp3, 0xffffffff, ctx);
+			emit(A64_ORR(1, tmp_tag_reg, tmp_tag_reg, tmp3), ctx);
+		}
+		prog->num_logue_instr += 2;
+		MTE_PRNT("tag reg done\n");
+		//emit(0xd53b42ee, ctx); // mrs x14, tco TODO change to x28
+		//emit(0xd503419f, ctx); // msr tco, #0x1
+		prog->num_logue_instr += 2;
+		MTE_PRNT("MTE status stored and toggled\n");
+	}
 	return 0;
 }
 
@@ -329,15 +368,26 @@ static int emit_bpf_tail_call(struct jit_ctx *ctx)
 
 static void build_epilogue(struct jit_ctx *ctx)
 {
+	struct bpf_prog *prog = ctx->prog;
 	const u8 r0 = bpf2a64[BPF_REG_0];
 	const u8 r6 = bpf2a64[BPF_REG_6];
 	const u8 r7 = bpf2a64[BPF_REG_7];
 	const u8 r8 = bpf2a64[BPF_REG_8];
 	const u8 r9 = bpf2a64[BPF_REG_9];
 	const u8 fp = bpf2a64[BPF_REG_FP];
+	const u8 tmp_tag_reg = bpf2a64[TMP_REG_TAG];
+	const u8 tmp_mte_on_reg = bpf2a64[TMP_REG_MTE_ON];
+
+	if (prog->mte) {
+		//emit(0xd51b42ee, ctx); // msr tco, x14 TODO change to x28
+		prog->num_logue_instr += 1;
+		MTE_PRNT("MTE status restored\n");
+	}
 
 	/* We're done with BPF stack */
 	emit(A64_ADD_I(1, A64_SP, A64_SP, ctx->stack_size), ctx);
+
+	emit(A64_POP(tmp_tag_reg, tmp_mte_on_reg, A64_SP), ctx);
 
 	/* Restore fs (x25) and x26 */
 	emit(A64_POP(fp, A64_R(26), A64_SP), ctx);
@@ -345,6 +395,7 @@ static void build_epilogue(struct jit_ctx *ctx)
 	/* Restore callee-saved register */
 	emit(A64_POP(r8, r9, A64_SP), ctx);
 	emit(A64_POP(r6, r7, A64_SP), ctx);
+	prog->num_logue_instr += 1;
 
 	/* Restore FP/LR registers */
 	emit(A64_POP(A64_FP, A64_LR, A64_SP), ctx);
@@ -425,12 +476,14 @@ static int add_exception_handler(const struct bpf_insn *insn,
 static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
 		      bool extra_pass)
 {
+	struct bpf_prog *prog = ctx->prog;
 	const u8 code = insn->code;
 	const u8 dst = bpf2a64[insn->dst_reg];
 	const u8 src = bpf2a64[insn->src_reg];
 	const u8 tmp = bpf2a64[TMP_REG_1];
 	const u8 tmp2 = bpf2a64[TMP_REG_2];
 	const u8 tmp3 = bpf2a64[TMP_REG_3];
+	const u8 tmp_tag_reg = bpf2a64[TMP_REG_TAG];
 	const s16 off = insn->off;
 	const s32 imm = insn->imm;
 	const int i = insn - ctx->prog->insnsi;
@@ -802,20 +855,57 @@ emit_cond_jmp:
 	case BPF_LDX | BPF_PROBE_MEM | BPF_W:
 	case BPF_LDX | BPF_PROBE_MEM | BPF_H:
 	case BPF_LDX | BPF_PROBE_MEM | BPF_B:
-		emit_a64_mov_i(1, tmp, off, ctx);
-		switch (BPF_SIZE(code)) {
-		case BPF_W:
-			emit(A64_LDR32(dst, src, tmp), ctx);
-			break;
-		case BPF_H:
-			emit(A64_LDRH(dst, src, tmp), ctx);
-			break;
-		case BPF_B:
-			emit(A64_LDRB(dst, src, tmp), ctx);
-			break;
-		case BPF_DW:
-			emit(A64_LDR64(dst, src, tmp), ctx);
-			break;
+		if (!prog->mte) {
+			emit_a64_mov_i(1, tmp, off, ctx);
+			switch (BPF_SIZE(code)) {
+			case BPF_W:
+				emit(A64_LDR32(dst, src, tmp), ctx);
+				break;
+			case BPF_H:
+				emit(A64_LDRH(dst, src, tmp), ctx);
+				break;
+			case BPF_B:
+				emit(A64_LDRB(dst, src, tmp), ctx);
+				break;
+			case BPF_DW:
+				emit(A64_LDR64(dst, src, tmp), ctx);
+				break;
+			}
+		} else {
+			/*
+			 * Try to compute src + off with a single ADD.
+			 * ADD allows a 12-bit immediate value,
+			 * or a 12-bit value shifted by 12 bits (so a 24-bit value where the lower 12 bits are all zeros).
+			 * Normally 12 bits should be sufficient for off, unless the src is a ridiculously large structure.
+			 * If that's the case, we revert to loading off into a register.
+			 */
+			/* Calculate final address into tmp3 */
+			u32 my_a64_insn = A64_ADD_I(1, tmp3, src, off);
+			if (my_a64_insn != AARCH64_BREAK_FAULT) {
+				emit(my_a64_insn, ctx);
+			} else {
+				emit_a64_mov_i(1, tmp, off, ctx);
+				emit(A64_ADD(1, tmp3, tmp, src), ctx);
+			}
+			emit(A64_AND(1, tmp3, tmp3, tmp_tag_reg), ctx);
+			/* Offset 0 */
+			emit_a64_mov_i(1, tmp2, 0, ctx);
+			//MTE_PRNT("Instrumenting BPF_LDX\n");
+			switch (BPF_SIZE(code)) {
+			case BPF_W:
+				emit(A64_LDR32(dst, tmp3, tmp2), ctx);
+				break;
+			case BPF_H:
+				emit(A64_LDRH(dst, tmp3, tmp2), ctx);
+				break;
+			case BPF_B:
+				emit(A64_LDRB(dst, tmp3, tmp2), ctx);
+				break;
+			case BPF_DW:
+				emit(A64_LDR64(dst, tmp3, tmp2), ctx);
+				break;
+			}
+			prog->num_body_instr += 1;
 		}
 
 		ret = add_exception_handler(insn, ctx, dst);
@@ -841,22 +931,54 @@ emit_cond_jmp:
 	case BPF_ST | BPF_MEM | BPF_H:
 	case BPF_ST | BPF_MEM | BPF_B:
 	case BPF_ST | BPF_MEM | BPF_DW:
-		/* Load imm to a register then store it */
-		emit_a64_mov_i(1, tmp2, off, ctx);
-		emit_a64_mov_i(1, tmp, imm, ctx);
-		switch (BPF_SIZE(code)) {
-		case BPF_W:
-			emit(A64_STR32(tmp, dst, tmp2), ctx);
-			break;
-		case BPF_H:
-			emit(A64_STRH(tmp, dst, tmp2), ctx);
-			break;
-		case BPF_B:
-			emit(A64_STRB(tmp, dst, tmp2), ctx);
-			break;
-		case BPF_DW:
-			emit(A64_STR64(tmp, dst, tmp2), ctx);
-			break;
+		if (!prog->mte) {
+			/* Load imm to a register then store it */
+			emit_a64_mov_i(1, tmp2, off, ctx);
+			emit_a64_mov_i(1, tmp, imm, ctx);
+			switch (BPF_SIZE(code)) {
+			case BPF_W:
+				emit(A64_STR32(tmp, dst, tmp2), ctx);
+				break;
+			case BPF_H:
+				emit(A64_STRH(tmp, dst, tmp2), ctx);
+				break;
+			case BPF_B:
+				emit(A64_STRB(tmp, dst, tmp2), ctx);
+				break;
+			case BPF_DW:
+				emit(A64_STR64(tmp, dst, tmp2), ctx);
+				break;
+			}
+		} else {
+			/* Calculate final address into tmp3 */
+			u32 my_a64_insn = A64_ADD_I(1, tmp3, dst, off);
+			if (my_a64_insn != AARCH64_BREAK_FAULT) {
+				emit(my_a64_insn, ctx);
+			} else {
+				emit_a64_mov_i(1, tmp, off, ctx);
+				emit(A64_ADD(1, tmp3, tmp, dst), ctx);
+			}
+			emit(A64_AND(1, tmp3, tmp3, tmp_tag_reg), ctx);
+			/* Offset 0 */
+			emit_a64_mov_i(1, tmp2, 0, ctx);
+			/* Load imm */
+			emit_a64_mov_i(1, tmp, imm, ctx);
+			//MTE_PRNT("Instrumenting BPF_ST\n");
+			switch (BPF_SIZE(code)) {
+			case BPF_W:
+				emit(A64_STR32(tmp, tmp3, tmp2), ctx);
+				break;
+			case BPF_H:
+				emit(A64_STRH(tmp, tmp3, tmp2), ctx);
+				break;
+			case BPF_B:
+				emit(A64_STRB(tmp, tmp3, tmp2), ctx);
+				break;
+			case BPF_DW:
+				emit(A64_STR64(tmp, tmp3, tmp2), ctx);
+				break;
+			}
+			prog->num_body_instr += 1;
 		}
 		break;
 
@@ -865,20 +987,50 @@ emit_cond_jmp:
 	case BPF_STX | BPF_MEM | BPF_H:
 	case BPF_STX | BPF_MEM | BPF_B:
 	case BPF_STX | BPF_MEM | BPF_DW:
-		emit_a64_mov_i(1, tmp, off, ctx);
-		switch (BPF_SIZE(code)) {
-		case BPF_W:
-			emit(A64_STR32(src, dst, tmp), ctx);
-			break;
-		case BPF_H:
-			emit(A64_STRH(src, dst, tmp), ctx);
-			break;
-		case BPF_B:
-			emit(A64_STRB(src, dst, tmp), ctx);
-			break;
-		case BPF_DW:
-			emit(A64_STR64(src, dst, tmp), ctx);
-			break;
+		if (!prog->mte) {
+			emit_a64_mov_i(1, tmp, off, ctx);
+			switch (BPF_SIZE(code)) {
+			case BPF_W:
+				emit(A64_STR32(src, dst, tmp), ctx);
+				break;
+			case BPF_H:
+				emit(A64_STRH(src, dst, tmp), ctx);
+				break;
+			case BPF_B:
+				emit(A64_STRB(src, dst, tmp), ctx);
+				break;
+			case BPF_DW:
+				emit(A64_STR64(src, dst, tmp), ctx);
+				break;
+			}
+		} else {
+			/* Calculate final address into tmp3 */
+			u32 my_a64_insn = A64_ADD_I(1, tmp3, dst, off);
+			if (my_a64_insn != AARCH64_BREAK_FAULT) {
+				emit(my_a64_insn, ctx);
+			} else {
+				emit_a64_mov_i(1, tmp, off, ctx);
+				emit(A64_ADD(1, tmp3, tmp, dst), ctx);
+			}
+			emit(A64_AND(1, tmp3, tmp3, tmp_tag_reg), ctx);
+			/* Offset 0 */
+			emit_a64_mov_i(1, tmp2, 0, ctx);
+			//MTE_PRNT("Instrumenting BPF_STX\n");
+			switch (BPF_SIZE(code)) {
+			case BPF_W:
+				emit(A64_STR32(src, tmp3, tmp2), ctx);
+				break;
+			case BPF_H:
+				emit(A64_STRH(src, tmp3, tmp2), ctx);
+				break;
+			case BPF_B:
+				emit(A64_STRB(src, tmp3, tmp2), ctx);
+				break;
+			case BPF_DW:
+				emit(A64_STR64(src, tmp3, tmp2), ctx);
+				break;
+			}
+			prog->num_body_instr += 1;
 		}
 		break;
 
@@ -893,6 +1045,7 @@ emit_cond_jmp:
 		 * and
 		 * STX XADD: lock *(u64 *)(dst + off) += src
 		 */
+		/* TODO Instrument these atomic store and adds? */
 
 		if (!off) {
 			reg = dst;
@@ -904,6 +1057,7 @@ emit_cond_jmp:
 		if (cpus_have_cap(ARM64_HAS_LSE_ATOMICS)) {
 			emit(A64_STADD(isdw, reg, src), ctx);
 		} else {
+			/* This looks like LL/SC. */
 			emit(A64_LDXR(isdw, tmp2, reg), ctx);
 			emit(A64_ADD(isdw, tmp2, tmp2, src), ctx);
 			emit(A64_STXR(isdw, tmp2, reg, tmp3), ctx);
@@ -1005,6 +1159,17 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	if (!prog->jit_requested)
 		return orig_prog;
 
+	if (was_classic) {
+		jit_count_cbpf++;
+	} else {
+		jit_count_ebpf++;
+	}
+	MTE_PRNT("Hello(cbpf=%d,ebpf=%d) from the arm64 BPF JIT compiler prog at 0x%px ctx on stack at 0x%px!\n", jit_count_cbpf, jit_count_ebpf, prog, &ctx);
+	if (!was_classic && jit_count_ebpf >= JIT_COUNT_THLD) {
+		prog->mte = 1;
+	}
+	prog->num_jit = prog->num_logue_instr = prog->num_body_instr = 0;
+
 	tmp = bpf_jit_blind_constants(prog);
 	/* If blinding was requested and we failed during blinding,
 	 * we must fall back to the interpreter.
@@ -1025,6 +1190,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		}
 		prog->aux->jit_data = jit_data;
 	}
+	set_pstate_tco(0);
+	set_pstate_tco(1);
+	mte_enable_kernel_sync();
 	if (jit_data->ctx.offset) {
 		ctx = jit_data->ctx;
 		image_ptr = jit_data->image;
@@ -1098,8 +1266,10 @@ skip_init_ctx:
 	}
 
 	/* And we're done. */
-	if (bpf_jit_enable > 1)
+	if (bpf_jit_enable > 1 && !was_classic) {
 		bpf_jit_dump(prog->len, prog_size, 2, ctx.image);
+		MTE_PRNT("Hello(cbpf=%d,ebpf=%d,prog->mte=%d) from the arm64 BPF JIT compiler dumped jit into ctx.image at 0x%px!\n", jit_count_cbpf, jit_count_ebpf, prog->mte, ctx.image);
+	}
 
 	bpf_flush_icache(header, ctx.image + ctx.idx);
 
@@ -1121,6 +1291,12 @@ skip_init_ctx:
 	prog->bpf_func = (void *)ctx.image;
 	prog->jited = 1;
 	prog->jited_len = prog_size;
+	prog->num_jit = prog_size / sizeof(u32);
+	prog->num_logue_instr /= 2;
+	prog->num_body_instr /= 2;
+	if (bpf_jit_enable > 1 && !was_classic) {
+		MTE_PRNT("Hello(cbpf=%d,ebpf=%d,prog->mte=%d) from the arm64 BPF JIT compiler jit at ctx.image 0x%px [is_func, num_jit, num_logue_instr, num_body_instr, stack_size_B = %d, %u, %u, %u, %u]\n", jit_count_cbpf, jit_count_ebpf, prog->mte, ctx.image, prog->is_func, prog->num_jit, prog->num_logue_instr, prog->num_body_instr, ctx.stack_size);
+	}
 
 	if (!prog->is_func || extra_pass) {
 		bpf_prog_fill_jited_linfo(prog, ctx.offset + 1);

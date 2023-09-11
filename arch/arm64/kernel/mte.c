@@ -107,6 +107,7 @@ static inline void __mte_enable_kernel(const char *mode, unsigned long tcf)
 	isb();
 
 	pr_info_once("MTE: enabled in %s mode at EL1\n", mode);
+	MTE_PRNT("MTE enabled in %s mode at EL1\n", mode);
 }
 
 #ifdef CONFIG_KASAN_HW_TAGS

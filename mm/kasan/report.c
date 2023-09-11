@@ -340,7 +340,8 @@ static bool report_enabled(void)
 #endif
 	if (test_bit(KASAN_BIT_MULTI_SHOT, &kasan_flags))
 		return true;
-	return !test_and_set_bit(KASAN_BIT_REPORTED, &kasan_flags);
+	return true;
+	//return !test_and_set_bit(KASAN_BIT_REPORTED, &kasan_flags);
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)

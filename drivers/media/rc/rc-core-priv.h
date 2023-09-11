@@ -61,7 +61,8 @@ struct ir_raw_event_ctrl {
 	struct ir_raw_event this_ev;
 
 #ifdef CONFIG_BPF_LIRC_MODE2
-	u32				bpf_sample;
+	u32 __attribute__((aligned(16)))bpf_sample;
+	u32				padding[3];
 	struct bpf_prog_array __rcu	*progs;
 #endif
 #if IS_ENABLED(CONFIG_IR_NEC_DECODER)

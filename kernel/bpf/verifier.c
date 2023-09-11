@@ -13674,6 +13674,8 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
 	int i, len, ret = -EINVAL;
 	bool is_priv;
 
+	MTE_PRNT("Hello from the BPF verifier!\n");
+
 	/* no program is valid */
 	if (ARRAY_SIZE(bpf_verifier_ops) == 0)
 		return -EINVAL;
@@ -13686,6 +13688,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
 		return -ENOMEM;
 	log = &env->log;
 
+	(*prog)->mte = 0;
 	len = (*prog)->len;
 	env->insn_aux_data =
 		vzalloc(array_size(sizeof(struct bpf_insn_aux_data), len));

@@ -326,6 +326,7 @@ static void do_tag_recovery(unsigned long addr, unsigned int esr,
 			   struct pt_regs *regs)
 {
 
+	MTE_PRNT("addr 0x%lx pc/ip 0x%llx\n", addr, regs->pc);
 	report_tag_fault(addr, esr, regs);
 
 	/*

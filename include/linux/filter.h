@@ -573,11 +573,15 @@ struct bpf_prog {
 				has_callchain_buf:1, /* callchain buffer allocated? */
 				enforce_expected_attach_type:1, /* Enforce expected_attach_type checking at attach time */
 				call_get_stack:1, /* Do we call bpf_get_stack() or bpf_get_stackid() */
-				call_get_func_ip:1; /* Do we call get_func_ip() */
+				call_get_func_ip:1, /* Do we call get_func_ip() */
+				mte:1;		/* Is MTE enforced for this program? */
 	enum bpf_prog_type	type;		/* Type of BPF program */
 	enum bpf_attach_type	expected_attach_type; /* For some prog types */
-	u32			len;		/* Number of filter blocks */
+	u32			len;		/* Number of filter blocks */ // What this means is number of bytecode insn
 	u32			jited_len;	/* Size of jited insns in bytes */
+	u32			num_jit;	/* Size of JIT in # instructions */
+	u32			num_body_instr;	/* Size of sBPF instrumentation in # instructions in the body */
+	u32			num_logue_instr;/* Size of sBPF instrumentation in # instructions in the prologue/epilogue */
 	u8			tag[BPF_TAG_SIZE];
 	struct bpf_prog_stats __percpu *stats;
 	int __percpu		*active;
@@ -754,7 +758,18 @@ static inline u32 __bpf_prog_run_save_cb(const struct bpf_prog *prog,
 		memset(cb_data, 0, sizeof(cb_saved));
 	}
 
+	if (prog->mte) {
+		if ((u64)skb & (MTE_GRANULE_SIZE - 1)) {
+			MTE_PRNT("array not aligned to MTE_GRANULE_SIZE\n");
+		}
+		MTE_PRNT("About to tag skb\n");
+		//mte_set_mem_tag_range((struct sk_buff *)skb, round_up(sizeof(*skb), MTE_GRANULE_SIZE), 7, false);
+	}
 	res = bpf_prog_run(prog, skb);
+	if (prog->mte) {
+	// Untag
+	//mte_set_mem_tag_range(skb, round_up(array_size, MTE_GRANULE_SIZE), f, false);
+	}
 
 	if (unlikely(prog->cb_access))
 		memcpy(cb_data, cb_saved, sizeof(cb_saved));

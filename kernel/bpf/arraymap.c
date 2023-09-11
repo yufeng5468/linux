@@ -128,6 +128,7 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 	/* allocate all map elements and zero-initialize them */
 	if (attr->map_flags & BPF_F_MMAPABLE) {
 		void *data;
+		MTE_PRNT("mmapable array\n");
 
 		/* kmalloc'ed memory can't be mmap'ed, use explicit vmalloc */
 		data = bpf_map_area_mmapable_alloc(array_size, numa_node);
@@ -136,10 +137,16 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 		array = data + PAGE_ALIGN(sizeof(struct bpf_array))
 			- offsetof(struct bpf_array, value);
 	} else {
+		MTE_PRNT("non-mmapable array\n");
 		array = bpf_map_area_alloc(array_size, numa_node);
 	}
 	if (!array)
 		return ERR_PTR(-ENOMEM);
+	if ((u64)array & (MTE_GRANULE_SIZE - 1)) {
+		MTE_PRNT("array not aligned to MTE_GRANULE_SIZE\n");
+	}
+	MTE_PRNT("About to tag array map\n");
+	//mte_set_mem_tag_range(array, round_up(array_size, MTE_GRANULE_SIZE), 7, false);
 	array->index_mask = index_mask;
 	array->map.bypass_spec_v1 = bypass_spec_v1;
 
@@ -398,6 +405,9 @@ static void array_map_free_timers(struct bpf_map *map)
 static void array_map_free(struct bpf_map *map)
 {
 	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	//Clear tag on free
+	//TODO need to figure out array_size
+	//mte_set_mem_tag_range(array, round_up(array_size, MTE_GRANULE_SIZE), f, false);
 
 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
 		bpf_array_free_percpu(array);
